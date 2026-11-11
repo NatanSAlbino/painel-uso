@@ -1,0 +1,5 @@
+{
+  "name": "painel-uso",
+  "owner": { "name": "NatanSAlbino" },
+  "plugins": [{ "name": "painel-uso", "source": "./" }]
+}
