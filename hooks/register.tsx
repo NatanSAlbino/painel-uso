@@ -134,6 +134,9 @@ async function aplicar($: EngineInterface, nova: Leitura, fonte: Fonte) {
   const atualSessao = await read($, leitura)
   if (nova.medidoEm > atualSessao.medidoEm) {
     await update($, leitura, () => nova)
+    // A band asked for before this module loaded subscribed to nothing:
+    // ask for it again so a new reading always reaches the screen.
+    $.ui.invalidate('ui.render')
     const agora = await $.clock.now()
     const resumo = ordenar(nova.janelas)
       .map(j => atual(j, agora))
@@ -227,7 +230,15 @@ export const register: Register = on => {
     }
     void sincronizar($, true)
     $.clock.every(TICK_MS, () => void sincronizar($))
+    // The app may have asked for the band while this module was still loading.
+    $.ui.invalidate('ui.render')
     return ran
+  })
+
+  // The app opening (or reopening) this conversation: draw the band at once.
+  on('session.attach', ($, e, next) => {
+    $.ui.invalidate('ui.render')
+    return next(e)
   })
 
   on('session.measure', async ($, e, next) => {

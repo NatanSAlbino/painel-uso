@@ -29,6 +29,7 @@ function motor(on: any, opts: { respostas?: Resposta[]; store?: Record<string, u
   const store = new Map<string, unknown>(Object.entries(opts.store ?? {}))
   const relogio = { agora: INICIO }
   const pedidos: number[] = []
+  const contagem = { invalidacoes: 0 }
   const fila = [...(opts.respostas ?? [])]
   on('command.register', () => ({ value: { command: 'uso' } }))
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: opts.rateLimits ?? [] } }))
@@ -39,6 +40,7 @@ function motor(on: any, opts: { respostas?: Resposta[]; store?: Record<string, u
   on('clock.now', () => ({ value: relogio.agora }))
   on('clock.every', () => ({ value: {} }))
   on('ui.status', () => ({ value: undefined }))
+  on('ui.invalidate', () => (contagem.invalidacoes++, { value: undefined }))
   on('session.authorize', () => ({ value: { handle: 'h', kind: 'bearer' } }))
   on('http.fetch', () => {
     pedidos.push(relogio.agora)
@@ -46,7 +48,7 @@ function motor(on: any, opts: { respostas?: Resposta[]; store?: Record<string, u
   })
   on('session.start', (_: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
   on('session.measure', (_: unknown, e: { changed: unknown }) => ({ changed: e.changed }))
-  return { store, pedidos, relogio }
+  return { store, pedidos, relogio, contagem }
 }
 
 declare const setTimeout: (fn: (v?: unknown) => void, ms: number) => unknown
@@ -132,4 +134,15 @@ test('sem nenhuma leitura, o painel diz que está carregando', async ($, on) => 
   const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
   expect(await ui.find({ type: 'Text', text: /carregando/ })).toBeTruthy()
   await ui.unmount()
+})
+
+test('redesenha o painel quando o app abre a conversa e quando o mod termina de carregar', async ($, on) => {
+  const { contagem } = motor(on)
+  on('session.attach', () => ({ clientId: 'desktop-1' }))
+  await iniciar($)
+  const aposCarregar = contagem.invalidacoes
+  expect(aposCarregar).toBeGreaterThan(0)
+
+  await $.session.attach({ surface: 'desktop' } as never)
+  expect(contagem.invalidacoes).toBe(aposCarregar + 1)
 })
