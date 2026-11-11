@@ -11,11 +11,16 @@ const leitura = atom({ plugin: 'painel-uso', key: 'leitura' } as const, VAZIA, {
 const minuto = atom({ plugin: 'painel-uso', key: 'minuto' } as const, 0)
 const isHidden = atom({ plugin: 'painel-uso', key: 'isHidden' } as const, false)
 
-// One reading shared by every open session: the newest one wins.
-const STORE_KEY = 'leitura-compartilhada'
+// Each session shows its own account's figures: sessions may be signed in to
+// different accounts, so a reading is never shared between them.
 const URL_USO = 'https://api.anthropic.com/api/oauth/usage'
-const TICK_MS = 20_000
-const AO_VIVO_MS = 60_000
+const TICK_MS = 30_000
+// At most one live fetch per session in this window; responses fill the gaps.
+const AO_VIVO_MS = 3 * 60_000
+// After a 429 every session waits; the wait doubles up to the cap.
+const PAUSA_MIN_MS = 5 * 60_000
+const PAUSA_MAX_MS = 30 * 60_000
+const MAX_DIAG = 12
 const DIAS = ['dom.', 'seg.', 'ter.', 'qua.', 'qui.', 'sex.', 'sáb.']
 const ROTULO: Record<string, string> = {
   five_hour: 'Limite de 5 horas',
@@ -96,13 +101,36 @@ const ordenar = (lista: Janela[]) => {
 const limpar = (lista: readonly Janela[]): Janela[] =>
   lista.map(j => ({ kind: j.kind, percentUsed: j.percentUsed, resetsAt: j.resetsAt }))
 
-const ehLeitura = (v: unknown): v is Leitura =>
-  typeof v === 'object' && v !== null && Array.isArray((v as Leitura).janelas) &&
-  typeof (v as Leitura).medidoEm === 'number'
+type Fonte = 'ao-vivo' | 'resposta'
+type Registro = { cinco?: number; semana?: number; reinicia5h?: string; em: number }
+type Diag = Record<string, { atualizado: number; aoVivo?: Registro; resposta?: Registro; falha?: { motivo: string; em: number } }>
 
-// Keeps `nova` only where it is newer than what the session and the shared
-// store already hold; every session converges on the newest reading.
-async function aplicar($: EngineInterface, nova: Leitura) {
+const resumir = (l: Leitura): Registro => ({
+  cinco: l.janelas.find(j => j.kind === 'five_hour')?.percentUsed,
+  semana: l.janelas.find(j => j.kind === 'seven_day')?.percentUsed,
+  reinicia5h: l.janelas.find(j => j.kind === 'five_hour')?.resetsAt,
+  em: l.medidoEm,
+})
+
+// Per-session diagnostics, figures only (no credential, no response body),
+// kept for the last few sessions so their readings can be compared.
+async function diagnosticar(
+  $: EngineInterface,
+  mudar: (d: Diag[string]) => Diag[string],
+) {
+  const id = await $.session.id()
+  const agora = await $.clock.now()
+  const bruto = await $.store.get('diag')
+  const diag: Diag = typeof bruto === 'object' && bruto !== null ? (bruto as Diag) : {}
+  diag[id] = { ...mudar(diag[id] ?? { atualizado: agora }), atualizado: agora }
+  const recentes = Object.entries(diag)
+    .sort((a, b) => b[1].atualizado - a[1].atualizado)
+    .slice(0, MAX_DIAG)
+  await $.store.set('diag', Object.fromEntries(recentes))
+}
+
+// Keeps `nova` only where it is newer than this session's reading.
+async function aplicar($: EngineInterface, nova: Leitura, fonte: Fonte) {
   const atualSessao = await read($, leitura)
   if (nova.medidoEm > atualSessao.medidoEm) {
     await update($, leitura, () => nova)
@@ -113,10 +141,12 @@ async function aplicar($: EngineInterface, nova: Leitura) {
       .join(' · ')
     $.ui.status(resumo ? `Uso: ${resumo}` : undefined)
   }
-  const salvo = await $.store.get(STORE_KEY)
-  if (!ehLeitura(salvo) || nova.medidoEm > salvo.medidoEm) {
-    await $.store.set(STORE_KEY, nova)
-  }
+  await diagnosticar($, d => (fonte === 'ao-vivo' ? { ...d, aoVivo: resumir(nova) } : { ...d, resposta: resumir(nova) }))
+}
+
+async function falhar($: EngineInterface, motivo: string) {
+  const em = await $.clock.now()
+  await diagnosticar($, d => ({ ...d, falha: { motivo, em } }))
 }
 
 // The same figures as the app's usage menu, fetched live with the session's
@@ -125,16 +155,26 @@ async function buscarAoVivo($: EngineInterface): Promise<Leitura | null> {
   try {
     const auth = await $.session.authorize()
     if (!auth || auth.kind !== 'bearer') {
-      await $.store.set('ultima-falha', { motivo: auth ? 'sem login de assinatura' : 'sem credencial', em: await $.clock.now() })
+      await falhar($, auth ? 'sem login de assinatura' : 'sem credencial')
       return null
     }
     const r = await $.http.fetch(URL_USO, {
       auth: auth.handle,
       headers: { 'anthropic-beta': 'oauth-2025-04-20', accept: 'application/json' },
     })
+    if (r.status === 429) {
+      // Too many requests: every session backs off, longer each time.
+      const anterior = Number(await $.store.get('pausa-ms')) || 0
+      const pedida = Number(r.headers['retry-after'] ?? r.headers['Retry-After']) * 1000 || 0
+      const pausa = Math.min(PAUSA_MAX_MS, Math.max(PAUSA_MIN_MS, anterior * 2, pedida))
+      await $.store.set('pausa-ms', pausa)
+      await $.store.set('pausa-ate', (await $.clock.now()) + pausa)
+      await falhar($, 'HTTP 429')
+      return null
+    }
     if (!r.ok) {
       // Only the status code: the body is never stored.
-      await $.store.set('ultima-falha', { motivo: `HTTP ${r.status}`, em: await $.clock.now() })
+      await falhar($, `HTTP ${r.status}`)
       return null
     }
     const dados = JSON.parse(r.text) as Record<string, { utilization?: number | null; resets_at?: string | null } | null>
@@ -146,29 +186,31 @@ async function buscarAoVivo($: EngineInterface): Promise<Leitura | null> {
       }
     }
     if (janelas.length === 0) {
-      await $.store.set('ultima-falha', { motivo: `resposta sem limites (${Object.keys(dados).join(',')})`, em: await $.clock.now() })
+      await falhar($, `resposta sem limites (${Object.keys(dados).join(',')})`)
       return null
     }
-    const medidoEm = await $.clock.now()
-    await $.store.delete('ultima-falha')
-    await $.store.set('ultimo-ao-vivo', medidoEm)
-    return { janelas, medidoEm }
+    await $.store.delete('pausa-ms')
+    return { janelas, medidoEm: await $.clock.now() }
   } catch (erro) {
-    await $.store.set('ultima-falha', { motivo: `erro: ${String((erro as Error)?.message ?? erro).slice(0, 120)}`, em: await $.clock.now() })
+    await falhar($, `erro: ${String((erro as Error)?.message ?? erro).slice(0, 120)}`)
     return null
   }
 }
 
+// When this session last asked the server; module state is fine here, as a
+// reload only means one extra fetch.
+let ultimaBusca = 0
+
 async function sincronizar($: EngineInterface, forcar = false) {
   const agora = await $.clock.now()
   await update($, minuto, m => (Math.floor(agora / 60_000) === m ? m : Math.floor(agora / 60_000)))
-  const salvo = await $.store.get(STORE_KEY)
-  if (ehLeitura(salvo)) await aplicar($, salvo)
-  const maisNova = Math.max((await read($, leitura)).medidoEm, ehLeitura(salvo) ? salvo.medidoEm : 0)
-  // Only fetch when no session has a reading from the last minute.
-  if (forcar || agora - maisNova >= AO_VIVO_MS) {
+  const pausaAte = Number(await $.store.get('pausa-ate')) || 0
+  if (agora < pausaAte) return
+  const recente = agora - (await read($, leitura)).medidoEm < AO_VIVO_MS
+  if ((forcar || !recente) && agora - ultimaBusca >= AO_VIVO_MS) {
+    ultimaBusca = agora
     const viva = await buscarAoVivo($)
-    if (viva) await aplicar($, viva)
+    if (viva) await aplicar($, viva, 'ao-vivo')
   }
 }
 
@@ -181,7 +223,7 @@ export const register: Register = on => {
     })
     const { rateLimits } = await $.session.usage()
     if (rateLimits.length > 0) {
-      await aplicar($, { janelas: limpar(rateLimits), medidoEm: await $.clock.now() })
+      await aplicar($, { janelas: limpar(rateLimits), medidoEm: await $.clock.now() }, 'resposta')
     }
     void sincronizar($, true)
     $.clock.every(TICK_MS, () => void sincronizar($))
@@ -190,7 +232,7 @@ export const register: Register = on => {
 
   on('session.measure', async ($, e, next) => {
     if (e.changed.includes('rateLimits') && e.rateLimits.length > 0) {
-      await aplicar($, { janelas: limpar(e.rateLimits), medidoEm: await $.clock.now() })
+      await aplicar($, { janelas: limpar(e.rateLimits), medidoEm: await $.clock.now() }, 'resposta')
     }
     return next(e)
   })
