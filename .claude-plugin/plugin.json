@@ -1,6 +1,6 @@
 {
   "name": "painel-uso",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Painel fixo acima do prompt com o uso do limite de 5 horas e semanal do Claude",
   "types": "./types/index.d.ts"
 }

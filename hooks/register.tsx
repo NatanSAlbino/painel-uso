@@ -1,14 +1,21 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Janela } from '../types'
+import type { Janela, Leitura } from '../types'
 
-const janelas = atom({ plugin: 'painel-uso', key: 'janelas' } as const, [], {
-  shape: 'janelas-1',
+const VAZIA: Leitura = { janelas: [], medidoEm: 0 }
+const leitura = atom({ plugin: 'painel-uso', key: 'leitura' } as const, VAZIA, {
+  shape: 'leitura-1',
 })
+// Bumped once a minute so the countdown and the reading's age redraw.
+const minuto = atom({ plugin: 'painel-uso', key: 'minuto' } as const, 0)
 const isHidden = atom({ plugin: 'painel-uso', key: 'isHidden' } as const, false)
 
-const STORE_KEY = 'ultimas-janelas'
+// One reading shared by every open session: the newest one wins.
+const STORE_KEY = 'leitura-compartilhada'
+const URL_USO = 'https://api.anthropic.com/api/oauth/usage'
+const TICK_MS = 20_000
+const AO_VIVO_MS = 60_000
 const DIAS = ['dom.', 'seg.', 'ter.', 'qua.', 'qui.', 'sex.', 'sáb.']
 const ROTULO: Record<string, string> = {
   five_hour: 'Limite de 5 horas',
@@ -86,20 +93,86 @@ const ordenar = (lista: Janela[]) => {
   return [...lista].sort((a, b) => pos(a.kind) - pos(b.kind))
 }
 
-async function guardar($: EngineInterface, lista: Janela[]) {
-  const limpas = lista.map(j => ({ kind: j.kind, percentUsed: j.percentUsed, resetsAt: j.resetsAt }))
-  await update($, janelas, () => limpas)
-  await $.store.set(STORE_KEY, limpas)
+const limpar = (lista: readonly Janela[]): Janela[] =>
+  lista.map(j => ({ kind: j.kind, percentUsed: j.percentUsed, resetsAt: j.resetsAt }))
+
+const ehLeitura = (v: unknown): v is Leitura =>
+  typeof v === 'object' && v !== null && Array.isArray((v as Leitura).janelas) &&
+  typeof (v as Leitura).medidoEm === 'number'
+
+// Keeps `nova` only where it is newer than what the session and the shared
+// store already hold; every session converges on the newest reading.
+async function aplicar($: EngineInterface, nova: Leitura) {
+  const atualSessao = await read($, leitura)
+  if (nova.medidoEm > atualSessao.medidoEm) {
+    await update($, leitura, () => nova)
+    const agora = await $.clock.now()
+    const resumo = ordenar(nova.janelas)
+      .map(j => atual(j, agora))
+      .map(j => `${j.kind === 'five_hour' ? '5h' : j.kind === 'seven_day' ? 'Semana' : j.kind} ${fmtPct(j.percentUsed)}`)
+      .join(' · ')
+    $.ui.status(resumo ? `Uso: ${resumo}` : undefined)
+  }
+  const salvo = await $.store.get(STORE_KEY)
+  if (!ehLeitura(salvo) || nova.medidoEm > salvo.medidoEm) {
+    await $.store.set(STORE_KEY, nova)
+  }
+}
+
+// The same figures as the app's usage menu, fetched live with the session's
+// own Claude login; the credential stays on the host. Null when it fails.
+async function buscarAoVivo($: EngineInterface): Promise<Leitura | null> {
+  try {
+    const auth = await $.session.authorize()
+    if (!auth || auth.kind !== 'bearer') {
+      await $.store.set('ultima-falha', { motivo: auth ? 'sem login de assinatura' : 'sem credencial', em: await $.clock.now() })
+      return null
+    }
+    const r = await $.http.fetch(URL_USO, {
+      auth: auth.handle,
+      headers: { 'anthropic-beta': 'oauth-2025-04-20', accept: 'application/json' },
+    })
+    if (!r.ok) {
+      // Only the status code: the body is never stored.
+      await $.store.set('ultima-falha', { motivo: `HTTP ${r.status}`, em: await $.clock.now() })
+      return null
+    }
+    const dados = JSON.parse(r.text) as Record<string, { utilization?: number | null; resets_at?: string | null } | null>
+    const janelas: Janela[] = []
+    for (const kind of ['five_hour', 'seven_day']) {
+      const j = dados[kind]
+      if (j && typeof j.utilization === 'number') {
+        janelas.push({ kind, percentUsed: Math.round(j.utilization * 10) / 10, resetsAt: j.resets_at ?? undefined })
+      }
+    }
+    if (janelas.length === 0) {
+      await $.store.set('ultima-falha', { motivo: `resposta sem limites (${Object.keys(dados).join(',')})`, em: await $.clock.now() })
+      return null
+    }
+    const medidoEm = await $.clock.now()
+    await $.store.delete('ultima-falha')
+    await $.store.set('ultimo-ao-vivo', medidoEm)
+    return { janelas, medidoEm }
+  } catch (erro) {
+    await $.store.set('ultima-falha', { motivo: `erro: ${String((erro as Error)?.message ?? erro).slice(0, 120)}`, em: await $.clock.now() })
+    return null
+  }
+}
+
+async function sincronizar($: EngineInterface, forcar = false) {
   const agora = await $.clock.now()
-  const resumo = ordenar(limpas)
-    .map(j => atual(j, agora))
-    .map(j => `${j.kind === 'five_hour' ? '5h' : j.kind === 'seven_day' ? 'Semana' : j.kind} ${j.percentUsed}%`)
-    .join(' · ')
-  $.ui.status(resumo ? `Uso: ${resumo}` : undefined)
+  await update($, minuto, m => (Math.floor(agora / 60_000) === m ? m : Math.floor(agora / 60_000)))
+  const salvo = await $.store.get(STORE_KEY)
+  if (ehLeitura(salvo)) await aplicar($, salvo)
+  const maisNova = Math.max((await read($, leitura)).medidoEm, ehLeitura(salvo) ? salvo.medidoEm : 0)
+  // Only fetch when no session has a reading from the last minute.
+  if (forcar || agora - maisNova >= AO_VIVO_MS) {
+    const viva = await buscarAoVivo($)
+    if (viva) await aplicar($, viva)
+  }
 }
 
 export const register: Register = on => {
-
   on('session.start', async ($, e, next) => {
     const ran = await next(e)
     await $.command.register({
@@ -108,18 +181,16 @@ export const register: Register = on => {
     })
     const { rateLimits } = await $.session.usage()
     if (rateLimits.length > 0) {
-      await guardar($, rateLimits)
-    } else {
-      // No reading yet in this session: show the last one from any session.
-      const salvo = await $.store.get(STORE_KEY)
-      if (Array.isArray(salvo)) await guardar($, salvo as Janela[])
+      await aplicar($, { janelas: limpar(rateLimits), medidoEm: await $.clock.now() })
     }
+    void sincronizar($, true)
+    $.clock.every(TICK_MS, () => void sincronizar($))
     return ran
   })
 
   on('session.measure', async ($, e, next) => {
     if (e.changed.includes('rateLimits') && e.rateLimits.length > 0) {
-      await guardar($, e.rateLimits)
+      await aplicar($, { janelas: limpar(e.rateLimits), medidoEm: await $.clock.now() })
     }
     return next(e)
   })
@@ -133,10 +204,19 @@ export const register: Register = on => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey || (await read($, isHidden))) return next(e)
 
+    await read($, minuto)
     const agora = await $.clock.now()
-    const lista = ordenar(await read($, janelas)).map(j => atual(j, agora))
+    const { janelas, medidoEm } = await read($, leitura)
+    const lista = ordenar(janelas).map(j => atual(j, agora))
     const aviso = (pct: number) =>
       nivel(pct) === 'critico' ? ' · perto do limite' : nivel(pct) === 'alerta' ? ' · atenção' : ''
+    // Said only when the reading is not fresh, so a stale figure never passes as live.
+    const idadeMin = Math.floor((agora - medidoEm) / 60_000)
+    const idade =
+      lista.length > 0 && idadeMin >= 3
+        ? `Leitura de ${idadeMin >= 60 ? `${Math.floor(idadeMin / 60)}h ${pad(idadeMin % 60)}min` : `${idadeMin} min`} atrás`
+        : ''
+    const vazio = 'Uso do plano · carregando…'
 
     if (e.surface === 'terminal') {
       const { Box, Text } = $.ui.resolve(e)
@@ -144,7 +224,7 @@ export const register: Register = on => {
       const largura = Math.max(12, Math.min(48, colunas - 8))
 
       if (lista.length === 0) {
-        return <Text dimColor>Uso do plano · aparece após a primeira resposta</Text>
+        return <Text dimColor>{vazio}</Text>
       }
 
       return (
@@ -165,6 +245,7 @@ export const register: Register = on => {
               </Box>
             )
           })}
+          {idade !== '' && <Text dimColor>{idade}</Text>}
         </Box>
       )
     }
@@ -173,10 +254,11 @@ export const register: Register = on => {
     const { Box, Text, Svg } = $.ui.resolve(e)
 
     if (lista.length === 0) {
-      return <Text dimColor>Uso do plano · aparece após a primeira resposta</Text>
+      return <Text dimColor>{vazio}</Text>
     }
 
     return (
+      <Box flexDirection="column" rowGap="xs">
       <Box flexDirection="row" flexWrap="wrap" columnGap="lg" rowGap="sm">
         {lista.map(j => (
           <Box flexDirection="column" rowGap="xs">
@@ -196,6 +278,8 @@ export const register: Register = on => {
             </Text>
           </Box>
         ))}
+      </Box>
+      {idade !== '' && <Text dimColor>{idade}</Text>}
       </Box>
     )
   })
